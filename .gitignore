@@ -1,0 +1,7 @@
+/target
+.idea
+*local.toml
+*Cargo.lock
+/misc
+/.venv
+*.html
