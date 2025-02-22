@@ -1,13 +1,23 @@
-use csv::WriterBuilder;
+// src/lib.rs or src/main.rs
+mod config; // Declare the config module
+pub use config::AppSettings; // Re-export AppSettings
+
+use csv::{ReaderBuilder, WriterBuilder};
 use futures::stream::{self, StreamExt};
-use reqwest::Client;
+use regex::Regex;
+use reqwest::{
+    header::{self, HeaderValue},
+    Client,
+};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
 use std::error::Error as StdError;
 use std::fs::File;
+use std::path::Path;
 use std::time::Instant;
+use std::{collections::HashMap, fs::OpenOptions};
 use sysinfo::{Pid, System};
+use tracing::instrument;
 use tracing_subscriber::{self, fmt::format::FmtSpan};
 use url::Url;
 
@@ -16,81 +26,293 @@ struct Product {
     sku: String,
     brand: String,
     stock_status: i32,
+    stock_quantity: i32,
     sale_price: String,
     regular_price: String,
-    rate: f64,
     result: String,
-    link: String,
-    stock_quantity: i32,
 }
+
+// #[derive(Clone, Debug)]
+// struct LoginCredentials {
+//     auth_url: String,
+//     user_name: String,
+//     password: String,
+// }
+
+// struct KTWScraper {
+//     client: Client,
+//     base_url: String,
+//     all_p_page: String,
+//     shop_url: String,
+//     credentials: LoginCredentials,
+//     csv_path: String,
+// }
 
 struct KTWScraper {
     client: Client,
-    base_url: String,
-    max_page: String,
+    settings: AppSettings,
+}
+
+impl Product {
+    fn update_if_changed(&mut self, other: &Product) -> bool {
+        let mut changed = false;
+
+        if self.brand != other.brand
+            || self.sale_price != other.sale_price
+            || self.regular_price != other.regular_price
+        {
+            self.brand = other.brand.clone();
+            self.sale_price = other.sale_price.clone();
+            self.regular_price = other.regular_price.clone();
+            changed = true;
+        }
+        changed
+    }
+
+    fn update_stock(&mut self, quantity: i32) {
+        if self.stock_quantity != quantity {
+            self.stock_quantity = quantity;
+            self.stock_status = if quantity > 0 { 1 } else { 0 };
+        }
+    }
 }
 
 impl KTWScraper {
     #[instrument]
-    async fn new() -> Result<Self, Box<dyn StdError>> {
+    async fn new(settings: AppSettings) -> Result<Self, Box<dyn StdError>> {
         tracing::info!("Initializing KTW scraper");
         let client = Client::builder().cookie_store(true).build()?;
 
-        Ok(KTWScraper {
-            client,
-            base_url: "https://ktw.co.th".to_string(),
-            max_page: "?pageSize=108".to_string(),
-        })
+        Ok(Self { client, settings })
+    }
+    #[instrument(skip(self))]
+    async fn login(&self) -> Result<(), Box<dyn StdError>> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            ),
+        );
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        // headers.insert(header::ORIGIN, HeaderValue::from_static("https://shop.ktw.co.th"));
+        let origin = HeaderValue::from_str(&self.settings.shop_url).unwrap();
+        headers.insert(header::ORIGIN, origin);
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_str(&self.settings.shop_url_login).unwrap(),
+        );
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "JSESSIONID=397AA10DAF88A01EB582ED3D9730F705.node1; JSESSIONID=397AA10DAF88A01EB582ED3D9730F705.node1; acceleratorSecureGUID=9fcdf2a19fd23bbb1c60d58005a926cb7e838581",
+            ),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("j_username", self.settings.user_name.clone());
+        params.insert("j_password", self.settings.password.clone());
+
+        let response = self
+            .client
+            .post(&self.settings.auth_url)
+            .headers(headers)
+            .form(&params)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            tracing::info!("Login successful");
+            Ok(())
+        } else {
+            tracing::error!("Login failed: {}", response.status());
+            Err("Login failed".into())
+        }
     }
 
-    fn extract_page_number(&self, href: &str) -> Option<u32> {
-        let parsed_url = Url::parse(&format!("{}{}", self.base_url, href)).ok()?;
-        let pairs = parsed_url.query_pairs();
-        for (key, value) in pairs {
-            if key == "page" {
-                return value.parse().ok();
+    async fn check_stock(&self, sku: &str) -> Result<i32, Box<dyn StdError>> {
+        let url = format!(
+            "{}/ktw/th/THB/p/{}",
+            self.settings.shop_url.replace("/", "@"),
+            sku
+        );
+        let response = self.client.get(&url).send().await?;
+
+        tracing::info!(
+            "Checking stock for SKU: {} Status Call: {}",
+            sku,
+            response.status().as_str()
+        );
+
+        if !response.status().is_success() {
+            return Ok(0);
+        }
+
+        let text = response.text().await?;
+        let document = Html::parse_document(&text);
+
+        // Check if "สต๊อก" exists before scraping
+        let stock_header_selector = Selector::parse("h4").unwrap();
+        let stock_header_exists = document
+            .select(&stock_header_selector)
+            .any(|e| e.text().any(|t| t.trim() == "สต๊อก"));
+
+        if !stock_header_exists {
+            tracing::info!("No stock section found for SKU: {}", sku);
+            return Ok(0);
+        }
+
+        // Select the stock table area
+        let table_container_selector =
+            Selector::parse("div.table-responsive.stock-striped").unwrap();
+        let stock_td_selector = Selector::parse("td.text-right").unwrap();
+        let number_pattern = Regex::new(r"\d+").unwrap();
+        let mut total_stock = 0;
+
+        if let Some(table_container) = document.select(&table_container_selector).next() {
+            for td in table_container.select(&stock_td_selector) {
+                let text = td.text().collect::<String>().trim().to_string();
+                if let Some(capture) = number_pattern.find(&text) {
+                    if let Ok(num) = capture.as_str().parse::<i32>() {
+                        tracing::info!("Checking stock for SKU: {} Found stock {}", sku, num);
+                        total_stock += num;
+                    }
+                }
             }
         }
-        None
+
+        Ok(total_stock)
+    }
+
+    fn load_csv_products(&self) -> Result<HashMap<String, Product>, Box<dyn StdError>> {
+        if !Path::new(&self.settings.csv_path).exists() {
+            return Ok(HashMap::new());
+        }
+
+        let file = File::open(&self.settings.csv_path)?;
+        let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+        let mut products = HashMap::new();
+        for result in reader.deserialize() {
+            let product: Product = result?;
+            products.insert(product.sku.clone(), product);
+        }
+
+        Ok(products)
+    }
+
+    fn save_csv_products(
+        &self,
+        products: &HashMap<String, Product>,
+    ) -> Result<(), Box<dyn StdError>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&self.settings.csv_path)?;
+
+        let mut writer = WriterBuilder::new().has_headers(true).from_writer(file);
+
+        for product in products.values() {
+            writer.serialize(product)?;
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn update_product_stocks(&self) -> Result<(), Box<dyn StdError>> {
+        // Login first
+        self.login().await?;
+
+        // Load existing products
+        let mut products = self.load_csv_products()?;
+        let concurrent_requests = 100;
+
+        // Process stock updates concurrently
+        let _ = stream::iter(products.values_mut())
+            .map(|product| async {
+                if let Ok(stock) = self.check_stock(&product.sku).await {
+                    product.update_stock(stock);
+                }
+            })
+            .buffer_unordered(concurrent_requests) // Adjust concurrency level as needed
+            .collect::<Vec<_>>()
+            .await;
+
+        // Save updated products
+        self.save_csv_products(&products)?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn scrape_and_update(&self) -> Result<(), Box<dyn StdError>> {
+        // First, scrape new products
+        let mut existing_products = self.load_csv_products()?;
+        let new_products = self.scrape_all_products().await?;
+
+        // Update existing products or add new ones
+        for product in new_products {
+            if let Some(existing) = existing_products.get_mut(&product.sku) {
+                if existing.update_if_changed(&product) {
+                    tracing::info!("Updated product: {}", product.sku);
+                }
+            } else {
+                tracing::info!("Added new product: {}", product.sku);
+                existing_products.insert(product.sku.clone(), product);
+            }
+        }
+
+        // Save to CSV
+        self.save_csv_products(&existing_products)?;
+
+        // Now update stock quantities
+        self.update_product_stocks().await?;
+
+        Ok(())
     }
 
     #[instrument(skip(self))]
     async fn get_total_pages(&self) -> Result<u32, Box<dyn StdError>> {
         let start = Instant::now();
-        let url = format!("{}/c/cat_c05000000{}", self.base_url, self.max_page);
+        let url = format!("{}{}", &self.settings.base_url, &self.settings.all_p_page);
         tracing::info!(url = %url, "Fetching main page to determine total pages");
 
-        let response = self.client.get(&url).send().await?.text().await?;
+        let response = self.client.get(url).send().await?.text().await?;
         let document = Html::parse_document(&response);
 
         // Find the pagination-desktop div
-        let pagination_desktop = Selector::parse(".pagination-desktop").unwrap();
-        let pagination = Selector::parse("ul.pagination").unwrap();
-        let li_selector = Selector::parse("li").unwrap();
-        let a_selector = Selector::parse("a").unwrap();
+        let pagination_selector = Selector::parse("div.pagination-desktop").unwrap();
+        let last_link_selector = Selector::parse("a.page-link.last").unwrap();
 
-        if let Some(pagination_div) = document.select(&pagination_desktop).next() {
-            if let Some(ul) = pagination_div.select(&pagination).next() {
-                let li_elements: Vec<_> = ul.select(&li_selector).collect();
-
-                // Get the last li element
-                if let Some(last_li) = li_elements.last() {
-                    if let Some(a_tag) = last_li.select(&a_selector).next() {
-                        if let Some(href) = a_tag.value().attr("href") {
-                            if let Some(page_num) = self.extract_page_number(href) {
-                                tracing::info!(
-                                    total_pages = page_num,
-                                    duration = ?start.elapsed(),
-                                    "Found total number of pages"
-                                );
-                                return Ok(page_num);
+        if let Some(pagination_div) = document.select(&pagination_selector).next() {
+            if let Some(last_link) = pagination_div.select(&last_link_selector).next() {
+                if let Some(href) = last_link.value().attr("href") {
+                    // Parse the URL to extract the page parameter
+                    if let Ok(parsed_url) = Url::parse(&format!("https://ktw.co.th{}", href)) {
+                        let pairs = parsed_url.query_pairs();
+                        for (key, value) in pairs {
+                            if key == "page" {
+                                if let Ok(page_num) = value.parse::<u32>() {
+                                    tracing::info!(
+                                        total_pages = page_num + 1,
+                                        duration = ?start.elapsed(),
+                                        "Found total number of pages"
+                                    );
+                                    return Ok(page_num + 1);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
         tracing::error!("Could not find pagination information");
         Err("Could not determine total pages".into())
     }
@@ -98,10 +320,16 @@ impl KTWScraper {
     #[instrument(skip(self), fields(page = %page))]
     async fn scrape_page(&self, page: u32) -> Result<Vec<Product>, Box<dyn StdError>> {
         let start = Instant::now();
-        let url = format!(
-            "{}/c/cat_c05000000?pageSize=108&page={}",
-            self.base_url, page
-        );
+        let url = if page == 1 {
+            format!("{}{}", self.settings.base_url, self.settings.all_p_page)
+        } else {
+            format!(
+                "{}&page={}{}",
+                self.settings.base_url,
+                page - 1,
+                self.settings.all_p_page
+            )
+        };
         tracing::info!(url = %url, "Starting page scrape");
 
         let response = self.client.get(&url).send().await?.text().await?;
@@ -115,19 +343,17 @@ impl KTWScraper {
         let document = Html::parse_document(&response);
 
         // Updated selectors based on actual HTML structure
-        let container_selector = Selector::parse(
-            ".yCmsComponent.product__list--wrapper.yComponentWrapper.product-list-right-component",
-        )
-        .unwrap();
-        let container = document.select(&container_selector).next().unwrap();
+        // let container_selector = Selector::parse(
+        //     ".yCmsComponent search-list-page-right-result-list-component",
+        // ).unwrap();
+        // let container = document.select(&container_selector).next().unwrap();
         let grid_selector = Selector::parse(".zproduct-grid").unwrap();
-        let grids = container.select(&grid_selector);
+        let grids = document.select(&grid_selector);
 
         let sku_selector = Selector::parse(".grid-item__sku").unwrap();
         let brand_selector = Selector::parse(".grid-item__brand").unwrap();
         let sale_price_selector = Selector::parse(".grid-item__saleprice").unwrap();
         let regular_price_selector = Selector::parse(".grid-item__wasprice").unwrap();
-        let link_selector = Selector::parse(".grid-item__description a").unwrap();
 
         let mut products = Vec::new();
 
@@ -164,13 +390,6 @@ impl KTWScraper {
                         .map(|el| el.text().collect::<String>())
                         .unwrap_or_default();
 
-                    let link = item
-                        .select(&link_selector)
-                        .next()
-                        .and_then(|el| el.value().attr("href"))
-                        .map(|href| format!("{}{}", self.base_url, href))
-                        .unwrap_or_default();
-
                     tracing::info!(
                         sku = %sku,
                         brand = %brand,
@@ -181,12 +400,10 @@ impl KTWScraper {
                         sku: sku.trim().to_string(),
                         brand: brand.trim().to_string(),
                         stock_status: 0,
+                        stock_quantity: 0,
                         sale_price: sale_price.trim().to_string(),
                         regular_price: regular_price.trim().to_string(),
-                        rate: 0.99,
                         result: "-".to_string(),
-                        link,
-                        stock_quantity: 0,
                     });
                 }
             }
@@ -212,7 +429,7 @@ impl KTWScraper {
         let pages = stream::iter(1..=total_pages);
         let mut results = pages
             .map(|page| {
-                let scraper = self.clone();
+                let scraper = self;
                 async move {
                     match scraper.scrape_page(page).await {
                         Ok(products) => {
@@ -274,15 +491,6 @@ impl KTWScraper {
     }
 }
 
-impl Clone for KTWScraper {
-    fn clone(&self) -> Self {
-        KTWScraper {
-            client: self.client.clone(),
-            base_url: self.base_url.clone(),
-            max_page: self.max_page.clone(),
-        }
-    }
-}
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
     // Initialize tracing
@@ -305,10 +513,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let start = Instant::now();
     tracing::info!("Starting KTW scraping process");
 
-    let scraper = KTWScraper::new().await?;
-    let products = scraper.scrape_all_products().await?;
+    let settings = match AppSettings::from_file("config.json") {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!("Failed to load config file: {}. Using default settings.", e);
+            AppSettings::default()
+        }
+    };
 
-    scraper.save_to_csv(products, "ktw_products.csv").await?;
+    // Create scraper with settings
+    let scraper = KTWScraper::new(settings).await?;
+    scraper.scrape_and_update().await?;
 
     // Check max memory usage
     sys.refresh_processes();
