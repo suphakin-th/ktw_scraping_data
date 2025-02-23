@@ -4,7 +4,6 @@ pub use config::AppSettings; // Re-export AppSettings
 
 use csv::{ReaderBuilder, WriterBuilder};
 use futures::stream::{self, StreamExt};
-use regex::Regex;
 use reqwest::{
     header::{self, HeaderValue},
     Client,
@@ -82,65 +81,193 @@ impl KTWScraper {
     async fn new(settings: AppSettings) -> Result<Self, Box<dyn StdError>> {
         tracing::info!("Initializing KTW scraper");
         let client = Client::builder().cookie_store(true).build()?;
-
         Ok(Self { client, settings })
     }
+
+    async fn get_csrf_token(&self) -> Result<String, Box<dyn StdError>> {
+        let login_page_url = "https://shop.ktw.co.th/ktw/th/THB/login";
+
+        let response = self.client.get(login_page_url).send().await?;
+
+        if !response.status().is_success() {
+            return Err("Failed to get login page".into());
+        }
+
+        let text = response.text().await?;
+        let document = Html::parse_document(&text);
+        let selector = Selector::parse("input[name='CSRFToken']").unwrap();
+
+        if let Some(csrf_input) = document.select(&selector).next() {
+            if let Some(token) = csrf_input.value().attr("value") {
+                return Ok(token.to_string());
+            }
+        }
+
+        Err("CSRF token not found".into())
+    }
+
     #[instrument(skip(self))]
-    async fn login(&self) -> Result<(), Box<dyn StdError>> {
+    async fn login(&self) -> Result<String, Box<dyn StdError>> {
+        let login_post_url = format!(
+            "{}/ktw/th/THB/j_spring_security_check",
+            self.settings.shop_url
+        );
+
+        // Get CSRF token
+        let csrf_token = self.get_csrf_token().await?;
+        tracing::info!("Retrieved CSRF token: {}", csrf_token);
+
+        // Prepare form data
+        let mut form_data = HashMap::new();
+        form_data.insert("j_username", self.settings.user_name.clone());
+        form_data.insert("j_password", self.settings.password.clone());
+        form_data.insert("CSRFToken", csrf_token.clone());
+        form_data.insert("_csrf", csrf_token); // Add both token variants
+
+        // Setup headers
         let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"));
         headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            ),
-        );
-        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-        // headers.insert(header::ORIGIN, HeaderValue::from_static("https://shop.ktw.co.th"));
-        let origin = HeaderValue::from_str(&self.settings.shop_url).unwrap();
-        headers.insert(header::ORIGIN, origin);
-        headers.insert(
-            header::REFERER,
-            HeaderValue::from_str(&self.settings.shop_url_login).unwrap(),
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.5"),
         );
         headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static(
-                "JSESSIONID=397AA10DAF88A01EB582ED3D9730F705.node1; JSESSIONID=397AA10DAF88A01EB582ED3D9730F705.node1; acceleratorSecureGUID=9fcdf2a19fd23bbb1c60d58005a926cb7e838581",
-            ),
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
+        headers.insert(header::HOST, HeaderValue::from_static("shop.ktw.co.th"));
+        headers.insert(header::HOST, HeaderValue::from_static("shop.ktw.co.th"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_str(&self.settings.shop_url)?,
         );
 
-        let mut params = HashMap::new();
-        params.insert("j_username", self.settings.user_name.clone());
-        params.insert("j_password", self.settings.password.clone());
-
-        let response = self
+        // Perform login with automatic redirect handling
+        let login_response = self
             .client
-            .post(&self.settings.auth_url)
+            .post(login_post_url.clone())
             .headers(headers)
-            .form(&params)
+            .form(&form_data)
             .send()
             .await?;
 
-        if response.status().is_success() {
-            tracing::info!("Login successful");
-            Ok(())
-        } else {
-            tracing::error!("Login failed: {}", response.status());
-            Err("Login failed".into())
+        // Get cookies from response
+        let cookies: Vec<_> = login_response.cookies().collect();
+
+        let jsessionid = cookies
+            .iter()
+            .find(|c| c.name() == "JSESSIONID")
+            .ok_or("No JSESSIONID cookie found")?
+            .value()
+            .to_string();
+
+        // Verify login success by checking the account page
+        if !self.verify_login().await? {
+            tracing::error!("Login verification failed");
+            return Err("Login verification failed".into());
         }
+
+        tracing::info!("Login successful, obtained JSESSIONID: {}", jsessionid);
+        Ok(jsessionid)
     }
 
+    #[instrument(skip(self))]
+    async fn verify_login(&self) -> Result<bool, Box<dyn StdError>> {
+        let account_url = format!(
+            "{}/ktw/th/THB/my-account/update-profile",
+            self.settings.shop_url
+        );
+
+        let response = self.client.get(&account_url).send().await?;
+
+        // Check if we got redirected to login page
+        if response.url().path().contains("/login") {
+            return Ok(false);
+        }
+
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+
+        let text = response.text().await?;
+
+        // Save response for debugging
+        std::fs::write("login_verification.html", &text)?;
+
+        let document = Html::parse_document(&text);
+
+        // Check for multiple indicators of successful login
+        let profile_selector = Selector::parse("form#updateProfileForm").unwrap();
+        let username_selector = Selector::parse("input#profile.email").unwrap();
+        let logout_selector = Selector::parse("a[href*='logout']").unwrap();
+
+        Ok(document.select(&profile_selector).next().is_some()
+            || document.select(&username_selector).next().is_some()
+            || document.select(&logout_selector).next().is_some())
+    }
+
+    // Helper function to check if still logged in
+    async fn is_logged_in(&self) -> Result<bool, Box<dyn StdError>> {
+        let home_url = format!("{}/ktw/th/THB", self.settings.shop_url);
+        let response = self.client.get(&home_url).send().await?;
+
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+
+        let text = response.text().await?;
+        let document = Html::parse_document(&text);
+
+        let profile_selector =
+            Selector::parse("a[href='/ktw/th/THB/my-account/update-profile']").unwrap();
+        let username_selector = Selector::parse("span.header__user-name").unwrap();
+
+        Ok(document.select(&profile_selector).next().is_some()
+            || document.select(&username_selector).next().is_some())
+    }
+
+    #[instrument(skip(self))]
     async fn check_stock(&self, sku: &str) -> Result<i32, Box<dyn StdError>> {
+        // Setup headers with cookie
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"));
+        headers.insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.5"),
+        );
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
+        headers.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers.insert("sec-fetch-user", HeaderValue::from_static("?1"));
+        headers.insert("sec-gpc", HeaderValue::from_static("1"));
+        headers.insert(
+            header::UPGRADE_INSECURE_REQUESTS,
+            HeaderValue::from_static("1"),
+        );
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"));
+        headers.insert(
+            "sec-ch-ua",
+            HeaderValue::from_static(
+                "\"Not(A:Brand\";v=\"99\", \"Brave\";v=\"133\", \"Chromium\";v=\"133\"",
+            ),
+        );
+        headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+        headers.insert(
+            "sec-ch-ua-platform",
+            HeaderValue::from_static("\"Windows\""),
+        );
+
         let url = format!(
             "{}/ktw/th/THB/p/{}",
             self.settings.shop_url.replace("/", "@"),
             sku
         );
-        let response = self.client.get(&url).send().await?;
+
+        let response = self.client.get(&url).headers(headers).send().await?;
 
         tracing::info!(
             "Checking stock for SKU: {} Status Call: {}",
@@ -149,13 +276,20 @@ impl KTWScraper {
         );
 
         if !response.status().is_success() {
+            tracing::error!("Failed to get product page for SKU: {}", sku);
             return Ok(0);
         }
 
         let text = response.text().await?;
         let document = Html::parse_document(&text);
 
-        // Check if "สต๊อก" exists before scraping
+        // Debug: Save the first page to verify login state
+        if sku == "debug" {
+            std::fs::write("debug_stock_page.html", &text)?;
+            tracing::info!("Saved stock page HTML for debugging");
+        }
+
+        // Check if the stock section exists
         let stock_header_selector = Selector::parse("h4").unwrap();
         let stock_header_exists = document
             .select(&stock_header_selector)
@@ -166,25 +300,40 @@ impl KTWScraper {
             return Ok(0);
         }
 
-        // Select the stock table area
-        let table_container_selector =
-            Selector::parse("div.table-responsive.stock-striped").unwrap();
+        // Parse stock table
+        let table_selector = Selector::parse("div.table-responsive.stock-striped table").unwrap();
         let stock_td_selector = Selector::parse("td.text-right").unwrap();
-        let number_pattern = Regex::new(r"\d+").unwrap();
         let mut total_stock = 0;
 
-        if let Some(table_container) = document.select(&table_container_selector).next() {
-            for td in table_container.select(&stock_td_selector) {
+        if let Some(table) = document.select(&table_selector).next() {
+            for td in table.select(&stock_td_selector) {
                 let text = td.text().collect::<String>().trim().to_string();
-                if let Some(capture) = number_pattern.find(&text) {
-                    if let Ok(num) = capture.as_str().parse::<i32>() {
-                        tracing::info!("Checking stock for SKU: {} Found stock {}", sku, num);
-                        total_stock += num;
+
+                // Skip unit cells
+                if text.contains("SET") || text.contains("PCS") {
+                    continue;
+                }
+
+                // Handle "> 50" case
+                if text.contains(">") {
+                    if let Some(num) = text.split(">").nth(1) {
+                        if let Ok(val) = num.trim().parse::<i32>() {
+                            tracing::info!("Found '> {}' stock for SKU: {}", val, sku);
+                            total_stock += val;
+                            continue;
+                        }
                     }
+                }
+
+                // Handle normal numbers
+                if let Ok(num) = text.trim().parse::<i32>() {
+                    tracing::info!("Found stock {} for SKU: {}", num, sku);
+                    total_stock += num;
                 }
             }
         }
 
+        tracing::info!("Total stock for SKU {}: {}", sku, total_stock);
         Ok(total_stock)
     }
 
@@ -232,7 +381,7 @@ impl KTWScraper {
 
         // Load existing products
         let mut products = self.load_csv_products()?;
-        let concurrent_requests = 100;
+        let concurrent_requests = 500;
 
         // Process stock updates concurrently
         let _ = stream::iter(products.values_mut())
@@ -241,7 +390,7 @@ impl KTWScraper {
                     product.update_stock(stock);
                 }
             })
-            .buffer_unordered(concurrent_requests) // Adjust concurrency level as needed
+            .buffer_unordered(concurrent_requests)
             .collect::<Vec<_>>()
             .await;
 
@@ -513,7 +662,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let start = Instant::now();
     tracing::info!("Starting KTW scraping process");
 
-    let settings = match AppSettings::from_file("config.json") {
+    let settings = match AppSettings::from_file("src/config.json") {
         Ok(settings) => settings,
         Err(e) => {
             tracing::warn!("Failed to load config file: {}. Using default settings.", e);
