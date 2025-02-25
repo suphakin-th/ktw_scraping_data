@@ -5,15 +5,18 @@ use std::path::Path;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct AppSettings {
+    pub login_url: String,
     pub auth_url: String,
     pub user_name: String,
     pub password: String,
-    pub auth_key: String,
     pub base_url: String,
     pub all_p_page: String,
     pub shop_url: String,
     pub shop_url_login: String,
     pub csv_path: String,
+    pub telegram_token: String,
+    pub chat_id: String,
+    pub chunk_size: i32,
 }
 
 impl AppSettings {
@@ -28,16 +31,18 @@ impl AppSettings {
 
     pub fn default() -> Self {
         Self {
+            login_url: "https://shop.ktw.co.th/ktw/th/THB/login".to_string(),
             auth_url: "https://shop.ktw.co.th/ktw/th/THB/j_spring_security_check".to_string(),
             user_name: "default@example.com".to_string(),
             password: "default_password".to_string(),
-            auth_key: "default_key".to_string(),
             base_url: "https://ktw.co.th/search?pageSize=108".to_string(),
             all_p_page: "&q=%3Aprice-desc&altText=&viewType=grid#".to_string(),
             shop_url: "https://shop.ktw.co.th".to_string(),
             shop_url_login: "https://shop.ktw.co.th/login".to_string(),
             csv_path: "ktw_products.csv".to_string(),
+            telegram_token: "default_token".to_string(),
+            chat_id: "default_id".to_string(),
+            chunk_size: 800,
         }
     }
 }
-

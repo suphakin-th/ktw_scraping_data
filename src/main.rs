@@ -1,6 +1,7 @@
 // src/lib.rs or src/main.rs
 mod config; // Declare the config module
 pub use config::AppSettings; // Re-export AppSettings
+use teloxide::prelude::*;
 
 use csv::{ReaderBuilder, WriterBuilder};
 use futures::stream::{self, StreamExt};
@@ -8,6 +9,8 @@ use reqwest::{
     header::{self, HeaderValue},
     Client,
 };
+use std::process::Command;
+
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
@@ -31,50 +34,32 @@ struct Product {
     result: String,
 }
 
-// #[derive(Clone, Debug)]
-// struct LoginCredentials {
-//     auth_url: String,
-//     user_name: String,
-//     password: String,
-// }
-
-// struct KTWScraper {
-//     client: Client,
-//     base_url: String,
-//     all_p_page: String,
-//     shop_url: String,
-//     credentials: LoginCredentials,
-//     csv_path: String,
-// }
-
 struct KTWScraper {
     client: Client,
     settings: AppSettings,
 }
 
 impl Product {
+    // Update existing function to mark changes
     fn update_if_changed(&mut self, other: &Product) -> bool {
         let mut changed = false;
 
         if self.brand != other.brand
             || self.sale_price != other.sale_price
             || self.regular_price != other.regular_price
+            || self.stock_quantity != other.stock_quantity
         {
             self.brand = other.brand.clone();
             self.sale_price = other.sale_price.clone();
             self.regular_price = other.regular_price.clone();
+            self.stock_quantity = other.stock_quantity;
+            self.result = "pending".to_string();
             changed = true;
         }
         changed
     }
-
-    fn update_stock(&mut self, quantity: i32) {
-        if self.stock_quantity != quantity {
-            self.stock_quantity = quantity;
-            self.stock_status = if quantity > 0 { 1 } else { 0 };
-        }
-    }
 }
+
 
 impl KTWScraper {
     #[instrument]
@@ -274,7 +259,6 @@ impl KTWScraper {
             sku,
             response.status().as_str()
         );
-
         if !response.status().is_success() {
             tracing::error!("Failed to get product page for SKU: {}", sku);
             return Ok(0);
@@ -364,6 +348,7 @@ impl KTWScraper {
             .create(true)
             .open(&self.settings.csv_path)?;
 
+        tracing::info!("Save CSV and Writing");
         let mut writer = WriterBuilder::new().has_headers(true).from_writer(file);
 
         for product in products.values() {
@@ -371,58 +356,179 @@ impl KTWScraper {
         }
 
         writer.flush()?;
+        tracing::info!("Saved {} products to {}", products.len(), self.settings.csv_path);
+        let bot = Bot::new(self.settings.telegram_token.clone());
+        let _ = bot.send_message(self.settings.chat_id.clone(), format!("Saved {} products to {}", products.len(), self.settings.csv_path));
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn update_product_stocks(&self) -> Result<(), Box<dyn StdError>> {
+    async fn update_product_stocks(&self, chunk_size: usize, save_interval: usize) -> Result<(), Box<dyn StdError>> {
         // Login first
         self.login().await?;
 
         // Load existing products
         let mut products = self.load_csv_products()?;
-        let concurrent_requests = 500;
+        let product_keys: Vec<String> = products.keys().cloned().collect();
+        let total_products = product_keys.len();
+        
+        let bot = Bot::new(self.settings.telegram_token.clone());
+        bot.send_message(
+            self.settings.chat_id.clone(),
+            format!("Starting Update Data Stock CSV - Processing {} products in chunks of {}", total_products, chunk_size)
+        ).await?;
 
-        // Process stock updates concurrently
-        let _ = stream::iter(products.values_mut())
-            .map(|product| async {
-                if let Ok(stock) = self.check_stock(&product.sku).await {
-                    product.update_stock(stock);
+        // Process in chunks
+        let concurrent_requests = 100; // Reduced from 200 to avoid overwhelming the server
+        let mut processed_count = 0;
+        let mut changes_count = 0;
+
+        for (chunk_index, keys_chunk) in product_keys.chunks(chunk_size).enumerate() {
+            let chunk_start = Instant::now();
+            tracing::info!(
+                "Processing chunk {}/{} ({} products)",
+                chunk_index + 1,
+                (total_products + chunk_size - 1) / chunk_size,
+                keys_chunk.len()
+            );
+            
+            // Send notification for chunk start
+            bot.send_message(
+                self.settings.chat_id.clone(),
+                format!(
+                    "Processing chunk {}/{} - Products {}-{} of {}",
+                    chunk_index + 1,
+                    (total_products + chunk_size - 1) / chunk_size,
+                    processed_count + 1,
+                    processed_count + keys_chunk.len(),
+                    total_products
+                )
+            ).await?;
+
+            // For each product in the chunk, check stock concurrently
+            let mut chunk_items = Vec::new();
+            for key in keys_chunk {
+                if let Some(product) = products.get(key) {
+                    chunk_items.push((product.sku.clone(), product.stock_quantity));
                 }
-            })
-            .buffer_unordered(concurrent_requests)
-            .collect::<Vec<_>>()
-            .await;
+            }
 
-        // Save updated products
+            let results = stream::iter(chunk_items)
+                .map(|(sku, current_stock)| {
+                    let scraper = self;
+                    async move {
+                        let stock_result = scraper.check_stock(&sku).await;
+                        (sku, current_stock, stock_result)
+                    }
+                })
+                .buffer_unordered(concurrent_requests)
+                .collect::<Vec<_>>()
+                .await;
+
+            // Update the products with stock information
+            for (sku, current_stock, stock_result) in results {
+                if let Some(product) = products.get_mut(&sku) {
+                    if let Ok(new_stock) = stock_result {
+                        // Only mark as "pending" if the stock actually changed
+                        if current_stock != new_stock {
+                            product.stock_quantity = new_stock;
+                            product.stock_status = if new_stock > 0 { 1 } else { 0 };
+                            product.result = "pending".to_string();
+                            changes_count += 1;
+                            
+                            tracing::info!(
+                                sku = %sku,
+                                old_stock = current_stock,
+                                new_stock = new_stock,
+                                "Stock changed - marked as pending"
+                            );
+                        }
+                        
+                        processed_count += 1;
+                        
+                        // Log every 10 products for visibility
+                        if processed_count % 10 == 0 {
+                            tracing::info!("Processed {} of {} products, {} changes detected", 
+                                processed_count, total_products, changes_count);
+                        }
+                    }
+                }
+            }
+
+            // Save periodically (after each chunk or when reaching save_interval)
+            if chunk_index % save_interval == save_interval - 1 || chunk_index == product_keys.chunks(chunk_size).len() - 1 {
+                tracing::info!("Saving intermediate results after processing {} products", processed_count);
+                self.save_csv_products(&products)?;
+                
+                bot.send_message(
+                    self.settings.chat_id.clone(),
+                    format!("Progress update: Processed {}/{} products ({}%). {} changes detected. Saved intermediate results.", 
+                        processed_count, 
+                        total_products,
+                        (processed_count as f64 / total_products as f64 * 100.0) as u32,
+                        changes_count
+                    )
+                ).await?;
+            }
+
+            tracing::info!(
+                "Completed chunk {}/{} in {:?}",
+                chunk_index + 1,
+                (total_products + chunk_size - 1) / chunk_size,
+                chunk_start.elapsed()
+            );
+        }
+
+        // Final save of all products
         self.save_csv_products(&products)?;
-
+        
+        // Send completion notification
+        bot.send_message(
+            self.settings.chat_id.clone(),
+            format!("Completed stock update for all {} products. {} products marked as pending.", 
+                total_products, changes_count)
+        ).await?;
+        
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn scrape_and_update(&self) -> Result<(), Box<dyn StdError>> {
-        // First, scrape new products
+    async fn scrape_and_update(&self, chunk_size: usize, save_interval: usize) -> Result<(), Box<dyn StdError>> {
+        // Load existing products
         let mut existing_products = self.load_csv_products()?;
+        tracing::info!("Loaded {} existing products from CSV", existing_products.len());
+        
+        // First, scrape new products with our enhanced logic
         let new_products = self.scrape_all_products().await?;
-
+        
         // Update existing products or add new ones
+        let mut updates_count = 0;
+        let mut new_count = 0;
+        
         for product in new_products {
             if let Some(existing) = existing_products.get_mut(&product.sku) {
                 if existing.update_if_changed(&product) {
                     tracing::info!("Updated product: {}", product.sku);
+                    updates_count += 1;
                 }
             } else {
                 tracing::info!("Added new product: {}", product.sku);
-                existing_products.insert(product.sku.clone(), product);
+                // For new products, set result to "pending"
+                let mut new_product = product;
+                new_product.result = "pending".to_string();
+                existing_products.insert(new_product.sku.clone(), new_product);
+                new_count += 1;
             }
         }
 
+        tracing::info!("Updated {} products, added {} new products", updates_count, new_count);
+        
         // Save to CSV
+        tracing::info!("Saving data to CSV");
         self.save_csv_products(&existing_products)?;
 
-        // Now update stock quantities
-        self.update_product_stocks().await?;
+        // Now update stock quantities with chunking
+        self.update_product_stocks(chunk_size, save_interval).await?;
 
         Ok(())
     }
@@ -492,10 +598,6 @@ impl KTWScraper {
         let document = Html::parse_document(&response);
 
         // Updated selectors based on actual HTML structure
-        // let container_selector = Selector::parse(
-        //     ".yCmsComponent search-list-page-right-result-list-component",
-        // ).unwrap();
-        // let container = document.select(&container_selector).next().unwrap();
         let grid_selector = Selector::parse(".zproduct-grid").unwrap();
         let grids = document.select(&grid_selector);
 
@@ -572,8 +674,18 @@ impl KTWScraper {
         let total_pages = self.get_total_pages().await?;
         tracing::info!(total_pages = total_pages, "Starting full scrape");
 
+        // Load existing products from CSV for comparison
+        let existing_products = self.load_csv_products()?;
+        tracing::info!(
+            existing_products = existing_products.len(),
+            "Loaded existing products for comparison"
+        );
+
         let mut all_products = Vec::new();
-        let concurrent_requests = 100;
+        let mut skipped_count = 0;
+        let mut updated_count = 0;
+        let mut new_count = 0;
+        let concurrent_requests = 50;
 
         let pages = stream::iter(1..=total_pages);
         let mut results = pages
@@ -600,16 +712,71 @@ impl KTWScraper {
 
         while let Some(result) = results.next().await {
             match result {
-                Ok(products) => all_products.extend(products),
+                Ok(page_products) => {
+                    for mut new_product in page_products {
+                        // Check if this product exists in our CSV
+                        if let Some(existing_product) = existing_products.get(&new_product.sku) {
+                            // Compare relevant fields
+                            let stock_matches = new_product.stock_quantity == existing_product.stock_quantity;
+                            let sale_price_matches = new_product.sale_price == existing_product.sale_price;
+                            let regular_price_matches = new_product.regular_price == existing_product.regular_price;
+                            
+                            // If all values match, skip this product
+                            if stock_matches && sale_price_matches && regular_price_matches {
+                                tracing::debug!(
+                                    sku = %new_product.sku,
+                                    "Skipping product - no changes detected"
+                                );
+                                skipped_count += 1;
+                                continue;
+                            } else {
+                                // Some values changed, mark as "pending"
+                                new_product.result = "pending".to_string();
+                                tracing::info!(
+                                    sku = %new_product.sku,
+                                    stock_changed = !stock_matches,
+                                    sale_price_changed = !sale_price_matches,
+                                    regular_price_changed = !regular_price_matches,
+                                    "Product changes detected - marked as pending"
+                                );
+                                updated_count += 1;
+                            }
+                        } else {
+                            // This is a new product
+                            tracing::info!(
+                                sku = %new_product.sku,
+                                "New product found"
+                            );
+                            new_count += 1;
+                        }
+                        
+                        // Add product to our results
+                        all_products.push(new_product);
+                    }
+                }
                 Err(e) => tracing::error!(error = %e, "Error processing page"),
             }
         }
 
         tracing::info!(
             total_products = all_products.len(),
+            new_products = new_count,
+            updated_products = updated_count,
+            skipped_products = skipped_count,
             duration = ?start.elapsed(),
             "Completed full scrape"
         );
+        
+        // Report via Telegram as well
+        let bot = Bot::new(self.settings.telegram_token.clone());
+        let _ = bot.send_message(
+            self.settings.chat_id.clone(), 
+            format!(
+                "Scrape completed:\n- Total: {}\n- New: {}\n- Updated: {}\n- Skipped: {}\n- Duration: {:?}",
+                all_products.len(), new_count, updated_count, skipped_count, start.elapsed()
+            )
+        ).await;
+        
         Ok(all_products)
     }
 
@@ -642,6 +809,15 @@ impl KTWScraper {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
+    // Initialize settings
+    let settings = match AppSettings::from_file("src/config.json") {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!("Failed to load config file: {}. Using default settings.", e);
+            AppSettings::default()
+        }
+    };
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(false)
@@ -659,26 +835,42 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let pid = Pid::from(std::process::id() as usize);
     let mut max_mem_usage = 0; // Track maximum memory usage in KB
 
+    // Configure chunking parameters
+    let chunk_size = settings.chunk_size; // Process 100 products at a time
+    let save_interval = 1;  // Save after each chunk
+
+    // Start scraping
     let start = Instant::now();
     tracing::info!("Starting KTW scraping process");
-
-    let settings = match AppSettings::from_file("src/config.json") {
-        Ok(settings) => settings,
-        Err(e) => {
-            tracing::warn!("Failed to load config file: {}. Using default settings.", e);
-            AppSettings::default()
-        }
-    };
+    let bot = Bot::new(settings.telegram_token.clone());
+    bot.send_message(settings.chat_id.clone(), "Starting KTW scraping process").await?;
 
     // Create scraper with settings
-    let scraper = KTWScraper::new(settings).await?;
-    scraper.scrape_and_update().await?;
+    let scraper: KTWScraper = KTWScraper::new(settings.clone()).await?;
+    scraper.scrape_and_update(chunk_size.try_into().unwrap(), save_interval).await?;
 
     // Check max memory usage
     sys.refresh_processes();
     if let Some(process) = sys.process(pid) {
         max_mem_usage = process.memory();
     }
+
+    // Execute Python script and wait for it to complete
+    tracing::info!("Executing Python script: send_data.py");
+    let python_status = Command::new("python3")
+        .arg("src/send_data.py")
+        .status()
+        .expect("Failed to execute Python script");
+    tracing::info!("{:?}", python_status);
+    let mut txt_stat: String = "".to_string();
+    if python_status.success() {
+        tracing::info!("Python script executed successfully");
+        txt_stat = "Python script executed successfully".to_string();
+    } else {
+        tracing::error!("Python script failed with exit code: {:?}", python_status.code());
+        txt_stat = format!("Python script send_data.py failed with exit code: {:?}", python_status.code()).to_string();
+    }
+    bot.send_message(settings.chat_id.clone(), txt_stat).await?;
 
     tracing::info!(
         total_duration = ?start.elapsed(),
@@ -687,5 +879,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         max_memory_gb = max_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0),
         "Scraping process completed"
     );
+    bot.send_message(settings.chat_id.clone(), format!("Duration : {:?}\nMax Memory Usage: {:.2} MB", start.elapsed(), max_mem_usage as f64 / (1024.0 * 1024.0))).await?;
     Ok(())
 }
