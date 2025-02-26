@@ -1,0 +1,15 @@
+{
+	"OTHER_BRAND_DC_RATIO": 0.99,
+	"SP_BRAND_DC_RATIO": {
+		"polo": 0.98,
+		"jasic": 0.99,
+		"valu": 0.97,
+		"wd40": 0.72,
+		"marathon": 0.99,
+		"force": 0.99,
+		"ebara": 0.97,
+		"makita": 0.93,
+		"karcher": 0.99,
+		"novo": 0.95
+	}
+}
