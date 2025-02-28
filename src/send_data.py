@@ -1,8 +1,10 @@
 import csv
 import json
+import os
 import requests
 
 def detect_delimiter(file_path):
+    file_path = os.path.abspath(file_path)
     with open(file_path, mode='r', encoding='utf-8') as file:
         first_line = file.readline()
         if ',' in first_line:
@@ -12,10 +14,12 @@ def detect_delimiter(file_path):
         return ','
       
 def read_xconfig(file_path):
+    file_path = os.path.abspath(file_path)
     with open(file_path, mode='r', encoding='utf-8', newline='') as file:
         return json.load(file)
 
 def read_csv(file_path):
+    file_path = os.path.abspath(file_path)
     delimiter = detect_delimiter(file_path)
     with open(file_path, mode='r', encoding='utf-8') as file:
         reader = csv.reader(file, delimiter=delimiter)
@@ -142,6 +146,10 @@ def process_csv(file_path: str, cfg: json):
 
 if __name__ == "__main__":
     print("Start Send Data")
-    csv_file_path = "ktw_products.csv"
-    cfg = read_xconfig("./src/xconfig.json")
-    process_csv(csv_file_path, cfg)
+    current_dir = os.getcwd()  # Get current working directory
+    parent_dir = os.path.dirname(current_dir)  # Get the parent directory
+    x_cfg_path = os.path.join(current_dir, "xconfig.json")
+    ktw_csv_path = os.path.join(parent_dir, "ktw_products.csv")
+    cfg = read_xconfig(x_cfg_path)
+    process_csv(ktw_csv_path, cfg)
+    print("End Send Data")
