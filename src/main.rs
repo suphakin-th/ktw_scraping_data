@@ -210,7 +210,6 @@ impl KTWScraper {
             || document.select(&username_selector).next().is_some())
     }
 
-    #[instrument(skip(self))]
     async fn check_stock(&self, sku: &str) -> Result<i32, Box<dyn StdError>> {
         // Setup headers with cookie
         let mut headers = reqwest::header::HeaderMap::new();
@@ -243,15 +242,14 @@ impl KTWScraper {
             "sec-ch-ua-platform",
             HeaderValue::from_static("\"Windows\""),
         );
-
+    
         let url = format!(
-            "{}/ktw/th/THB/p/{}",
-            self.settings.shop_url.replace("/", "@"),
+            "https://shop.ktw.co.th/ktw/th/THB/p/{}",
             sku
         );
-
+    
         let response = self.client.get(&url).headers(headers).send().await?;
-
+    
         tracing::info!(
             "Checking stock for SKU: {} Status Call: {}",
             sku,
@@ -261,63 +259,50 @@ impl KTWScraper {
             tracing::error!("Failed to get product page for SKU: {}", sku);
             return Ok(0);
         }
-
+    
         let text = response.text().await?;
         let document = Html::parse_document(&text);
-
-        // Debug: Save the first page to verify login state
-        if sku == "debug" {
-            std::fs::write("debug_stock_page.html", &text)?;
-            tracing::info!("Saved stock page HTML for debugging");
-        }
-
-        // Check if the stock section exists
-        let stock_header_selector = Selector::parse("h4").unwrap();
-        let stock_header_exists = document
-            .select(&stock_header_selector)
-            .any(|e| e.text().any(|t| t.trim() == "สต๊อก"));
-
-        if !stock_header_exists {
-            tracing::info!("No stock section found for SKU: {}", sku);
-            return Ok(0);
-        }
-
-        // Parse stock table
+    
+        // Find the stock table
         let table_selector = Selector::parse("div.table-responsive.stock-striped table").unwrap();
-        let stock_td_selector = Selector::parse("td.text-right").unwrap();
+        let table_header_selector = Selector::parse("th").unwrap();
+        let table_row_selector = Selector::parse("tr").unwrap();
+        let table_data_selector = Selector::parse("td").unwrap();
+    
+        let mut stock_index = 1; // Default to second column
         let mut total_stock = 0;
-
+    
         if let Some(table) = document.select(&table_selector).next() {
-            for td in table.select(&stock_td_selector) {
-                let text = td.text().collect::<String>().trim().to_string();
-
-                // Skip unit cells
-                if text.contains("SET") || text.contains("PCS") {
-                    continue;
+            // Find the correct stock column index
+            for (index, header) in table.select(&table_header_selector).enumerate() {
+                if header.text().any(|t| t.trim() == "ในสต๊อก") {
+                    stock_index = index;
+                    break;
                 }
-
-                // Handle "> 50" case
-                if text.contains(">") {
-                    if let Some(num) = text.split(">").nth(1) {
-                        if let Ok(val) = num.trim().parse::<i32>() {
-                            tracing::info!("Found '> {}' stock for SKU: {}", val, sku);
-                            total_stock += val;
-                            continue;
+            }
+    
+            // Parse stock rows
+            for row in table.select(&table_row_selector) {
+                let cells: Vec<_> = row.select(&table_data_selector).collect();
+                
+                if cells.len() > stock_index {
+                    let stock_cell = &cells[stock_index];
+                    let stock_text = stock_cell.text().collect::<String>();
+                    
+                    // Extract the last part of the text (number)
+                    if let Some(stock_num_str) = stock_text.split_whitespace().last() {
+                        if let Ok(stock_num) = stock_num_str.parse::<i32>() {
+                            total_stock += stock_num;
                         }
                     }
                 }
-
-                // Handle normal numbers
-                if let Ok(num) = text.trim().parse::<i32>() {
-                    tracing::info!("Found stock {} for SKU: {}", num, sku);
-                    total_stock += num;
-                }
             }
         }
-
+    
         tracing::info!("Total stock for SKU {}: {}", sku, total_stock);
         Ok(total_stock)
     }
+    
 
     fn load_csv_products(&self) -> Result<HashMap<String, Product>, Box<dyn StdError>> {
         if !Path::new(&self.settings.csv_path).exists() {
