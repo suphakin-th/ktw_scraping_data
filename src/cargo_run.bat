@@ -1,2 +1,1 @@
-@echo off
-cargo run
+cargo run >> .\cargo_run.log 2>&1

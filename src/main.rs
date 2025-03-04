@@ -382,12 +382,12 @@ impl KTWScraper {
         .await?;
 
         // Create a temp directory for chunk files
-        let temp_dir = format!("temp_chunks_{}", std::process::id());
+        let temp_dir = "temp_chunks";
         std::fs::create_dir_all(&temp_dir)?;
         tracing::info!("Created temporary directory for chunk files: {}", temp_dir);
 
         // Process in chunks
-        let concurrent_requests = 20;
+        let concurrent_requests = 50;
         let mut processed_count = 0;
         let mut changes_count = 0;
 
@@ -808,7 +808,7 @@ impl KTWScraper {
         );
 
         // Create a temp directory for page results
-        let temp_dir = format!("temp_pages_{}", std::process::id());
+        let temp_dir = "temp_pages";
         std::fs::create_dir_all(&temp_dir)?;
         tracing::info!("Created temporary directory for page files: {}", temp_dir);
 
@@ -821,7 +821,7 @@ impl KTWScraper {
         let mut results = pages
             .map(|page| {
                 let scraper = self;
-                let temp_dir = temp_dir.clone();
+                let temp_dir = temp_dir;
                 let products_ref = std::sync::Arc::clone(&existing_products);
 
                 async move {
