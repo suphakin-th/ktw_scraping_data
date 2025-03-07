@@ -1,14 +1,14 @@
 {
     "login_url": "https://shop.ktw.co.th/ktw/th/THB/login",
     "auth_url": "https://shop.ktw.co.th/ktw/th/THB/j_spring_security_check",
-    "user_name": "prakasit.y@exogro.co.th",
-    "password": "Mi%$CR951",
+    "user_name": "your_email@domain.com",
+    "password": "xxxxxxxxxxxxx",
     "base_url": "https://ktw.co.th/search?pageSize=108",
     "all_p_page": "&q=%3Aprice-desc&altText=&viewType=grid#",
     "shop_url": "https://shop.ktw.co.th",
     "shop_url_login": "https://shop.ktw.co.th/login",
     "csv_path": "ktw_products.csv",
-    "telegram_token": "7609176889:AAHAyOo3236l5JXalmauvfhPebxGp50FPUE",
-    "chat_id": "6086964368",
+    "telegram_token": "Token:Token",
+    "chat_id": "Chat ID",
     "chunk_size": 800
 }

@@ -242,14 +242,11 @@ impl KTWScraper {
             "sec-ch-ua-platform",
             HeaderValue::from_static("\"Windows\""),
         );
-    
-        let url = format!(
-            "https://shop.ktw.co.th/ktw/th/THB/p/{}",
-            sku
-        );
-    
+
+        let url = format!("https://shop.ktw.co.th/ktw/th/THB/p/{}", sku);
+
         let response = self.client.get(&url).headers(headers).send().await?;
-    
+
         tracing::info!(
             "Checking stock for SKU: {} Status Call: {}",
             sku,
@@ -259,19 +256,19 @@ impl KTWScraper {
             tracing::error!("Failed to get product page for SKU: {}", sku);
             return Ok(0);
         }
-    
+
         let text = response.text().await?;
         let document = Html::parse_document(&text);
-    
+
         // Find the stock table
         let table_selector = Selector::parse("div.table-responsive.stock-striped table").unwrap();
         let table_header_selector = Selector::parse("th").unwrap();
         let table_row_selector = Selector::parse("tr").unwrap();
         let table_data_selector = Selector::parse("td").unwrap();
-    
+
         let mut stock_index = 1; // Default to second column
         let mut total_stock = 0;
-    
+
         if let Some(table) = document.select(&table_selector).next() {
             // Find the correct stock column index
             for (index, header) in table.select(&table_header_selector).enumerate() {
@@ -280,15 +277,15 @@ impl KTWScraper {
                     break;
                 }
             }
-    
+
             // Parse stock rows
             for row in table.select(&table_row_selector) {
                 let cells: Vec<_> = row.select(&table_data_selector).collect();
-                
+
                 if cells.len() > stock_index {
                     let stock_cell = &cells[stock_index];
                     let stock_text = stock_cell.text().collect::<String>();
-                    
+
                     // Extract the last part of the text (number)
                     if let Some(stock_num_str) = stock_text.split_whitespace().last() {
                         if let Ok(stock_num) = stock_num_str.parse::<i32>() {
@@ -298,11 +295,10 @@ impl KTWScraper {
                 }
             }
         }
-    
+
         tracing::info!("Total stock for SKU {}: {}", sku, total_stock);
         Ok(total_stock)
     }
-    
 
     fn load_csv_products(&self) -> Result<HashMap<String, Product>, Box<dyn StdError>> {
         if !Path::new(&self.settings.csv_path).exists() {
@@ -375,7 +371,7 @@ impl KTWScraper {
         bot.send_message(
             self.settings.chat_id.clone(),
             format!(
-                "Starting Update Data Stock CSV - Processing {} products in chunks of {}",
+                "Starting Update Data Stock CSV - Processing {} products in chunks of {} send message to telegram every 5 chunks until finish",
                 total_products, chunk_size
             ),
         )
@@ -383,11 +379,11 @@ impl KTWScraper {
 
         // Create a temp directory for chunk files
         let temp_dir = "temp_chunks";
-        std::fs::create_dir_all(&temp_dir)?;
+        std::fs::create_dir_all(temp_dir)?;
         tracing::info!("Created temporary directory for chunk files: {}", temp_dir);
 
         // Process in chunks
-        let concurrent_requests = 50;
+        let concurrent_requests = 70;
         let mut processed_count = 0;
         let mut changes_count = 0;
 
@@ -396,23 +392,25 @@ impl KTWScraper {
             tracing::info!(
                 "Processing chunk {}/{} ({} products)",
                 chunk_index + 1,
-                (total_products + chunk_size - 1) / chunk_size,
+                total_products.div_ceil(chunk_size),
                 keys_chunk.len()
             );
 
             // Send notification for chunk start
-            bot.send_message(
-                self.settings.chat_id.clone(),
-                format!(
-                    "Processing chunk {}/{} - Products {}-{} of {}",
-                    chunk_index + 1,
-                    (total_products + chunk_size - 1) / chunk_size,
-                    processed_count + 1,
-                    processed_count + keys_chunk.len(),
-                    total_products
-                ),
-            )
-            .await?;
+            if (chunk_index + 1) % 5 == 0 {
+                bot.send_message(
+                    self.settings.chat_id.clone(),
+                    format!(
+                        "Processing chunk {}/{} - Products {}-{} of {}",
+                        chunk_index + 1,
+                        total_products.div_ceil(chunk_size),
+                        processed_count + 1,
+                        processed_count + keys_chunk.len(),
+                        total_products
+                    ),
+                )
+                .await?;
+            }
 
             // For each product in the chunk, check stock concurrently
             let mut chunk_items = Vec::new();
@@ -501,7 +499,7 @@ impl KTWScraper {
                 );
 
                 // Merge all chunk files into the main products HashMap
-                self.merge_chunk_files(&temp_dir, &mut products)?;
+                self.merge_chunk_files(temp_dir, &mut products)?;
 
                 // Save merged products
                 self.save_csv_products(&products)?;
@@ -520,19 +518,19 @@ impl KTWScraper {
             tracing::info!(
                 "Completed chunk {}/{} in {:?}",
                 chunk_index + 1,
-                (total_products + chunk_size - 1) / chunk_size,
+                total_products.div_ceil(chunk_size),
                 chunk_start.elapsed()
             );
         }
 
         // Final merge of all chunks
-        self.merge_chunk_files(&temp_dir, &mut products)?;
+        self.merge_chunk_files(temp_dir, &mut products)?;
 
         // Final save of all products
         self.save_csv_products(&products)?;
 
         // Clean up temp directory
-        std::fs::remove_dir_all(&temp_dir)?;
+        std::fs::remove_dir_all(temp_dir)?;
         tracing::info!("Removed temporary directory: {}", temp_dir);
 
         // Send completion notification
@@ -581,7 +579,7 @@ impl KTWScraper {
 
         for path in paths {
             let path = path?.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "csv") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "csv") {
                 tracing::info!("Merging chunk file: {:?}", path);
 
                 let file = File::open(&path)?;
@@ -620,6 +618,20 @@ impl KTWScraper {
         // Update existing products or add new ones
         let mut updates_count = 0;
         let mut new_count = 0;
+
+        // Example usage of update_if_changed
+        if let Some(existing_product) = existing_products.get_mut("example_sku") {
+            let new_product = Product {
+                sku: "example_sku".to_string(),
+                brand: "example_brand".to_string(),
+                stock_status: 1,
+                stock_quantity: 10,
+                sale_price: "100".to_string(),
+                regular_price: "120".to_string(),
+                result: "pending".to_string(),
+            };
+            existing_product.update_if_changed(&new_product);
+        }
 
         for product in new_products {
             let sku = product.sku.clone(); // Clone the SKU to use for HashMap lookup
@@ -809,19 +821,19 @@ impl KTWScraper {
 
         // Create a temp directory for page results
         let temp_dir = "temp_pages";
-        std::fs::create_dir_all(&temp_dir)?;
+        std::fs::create_dir_all(temp_dir)?;
         tracing::info!("Created temporary directory for page files: {}", temp_dir);
 
         let mut skipped_count = 0;
         let mut updated_count = 0;
         let mut new_count = 0;
-        let concurrent_requests = 50;
+        let concurrent_requests = 70;
 
         let pages = stream::iter(1..=total_pages);
         let mut results = pages
             .map(|page| {
                 let scraper = self;
-                let temp_dir = temp_dir;
+                let tempx = temp_dir;
                 let products_ref = std::sync::Arc::clone(&existing_products);
 
                 async move {
@@ -834,7 +846,7 @@ impl KTWScraper {
                             );
 
                             // Immediately save this page's products to a separate file
-                            let page_file = format!("{}/page_{}.csv", temp_dir, page);
+                            let page_file = format!("{}/page_{}.csv", tempx, page);
                             let file = OpenOptions::new()
                                 .write(true)
                                 .create(true)
@@ -910,11 +922,11 @@ impl KTWScraper {
 
         // Now merge all page files into a single result
         let mut all_products = Vec::new();
-        let paths = std::fs::read_dir(&temp_dir)?;
+        let paths = std::fs::read_dir(temp_dir)?;
 
         for path in paths {
             let path = path?.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "csv") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "csv") {
                 tracing::info!("Merging page file: {:?}", path);
 
                 let file = File::open(&path)?;
@@ -931,7 +943,8 @@ impl KTWScraper {
         }
 
         // Clean up temp directory
-        std::fs::remove_dir_all(&temp_dir)?;
+        std::fs::remove_dir_all(temp_dir)?;
+        tracing::info!("Removed temporary directory: {}", temp_dir);
 
         tracing::info!(
             total_products = all_products.len(),
@@ -1054,7 +1067,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         format!(
             "Python script send_data.py failed with exit code: {:?}",
             python_status.code()
-        ).to_string()
+        )
+        .to_string()
     };
 
     bot.send_message(settings.chat_id.clone(), txt_stat).await?;
