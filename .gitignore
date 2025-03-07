@@ -6,4 +6,4 @@
 /.venv
 *.html
 .csv
-*.json
+*config.json
