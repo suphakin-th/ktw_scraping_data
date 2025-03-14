@@ -71,9 +71,15 @@ impl KTWScraper {
         let login_page_url = "https://shop.ktw.co.th/ktw/th/THB/login";
 
         let response = self.client.get(login_page_url).send().await?;
+        let bot = Bot::new(self.settings.telegram_token.clone());
 
         if !response.status().is_success() {
+            bot.send_message(self.settings.chat_id.clone(), "Failed to get login page")
+                .await?;
             return Err("Failed to get login page".into());
+        } else {
+            bot.send_message(self.settings.chat_id.clone(), "Login Passed!!")
+                .await?;
         }
 
         let text = response.text().await?;
@@ -383,7 +389,7 @@ impl KTWScraper {
         tracing::info!("Created temporary directory for chunk files: {}", temp_dir);
 
         // Process in chunks
-        let concurrent_requests = 70;
+        let concurrent_requests = 30;
         let mut processed_count = 0;
         let mut changes_count = 0;
 
@@ -675,8 +681,18 @@ impl KTWScraper {
         let start = Instant::now();
         let url = format!("{}{}", &self.settings.base_url, &self.settings.all_p_page);
         tracing::info!(url = %url, "Fetching main page to determine total pages");
+        let bot = Bot::new(self.settings.telegram_token.clone());
 
-        let response = self.client.get(url).send().await?.text().await?;
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            bot.send_message(self.settings.chat_id.clone(), "Failed to get login page")
+                .await?;
+            return Err("Failed to get login page".into());
+        } else if response.status().is_client_error() {
+            bot.send_message(self.settings.chat_id.clone(), "ROBOT BLOCKED BY SERVER")
+                .await?;
+        }
+        let response = response.text().await?;
         let document = Html::parse_document(&response);
 
         // Find the pagination-desktop div
@@ -827,7 +843,7 @@ impl KTWScraper {
         let mut skipped_count = 0;
         let mut updated_count = 0;
         let mut new_count = 0;
-        let concurrent_requests = 70;
+        let concurrent_requests = 30;
 
         let pages = stream::iter(1..=total_pages);
         let mut results = pages
