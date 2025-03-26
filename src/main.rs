@@ -11,11 +11,13 @@ use reqwest::{
 };
 use std::process::Command;
 
+use rand::Rng;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::fs::File;
 use std::path::Path;
+use std::time::Duration;
 use std::time::Instant;
 use std::{collections::HashMap, fs::OpenOptions};
 use sysinfo::{Pid, System};
@@ -63,8 +65,40 @@ impl KTWScraper {
     #[instrument]
     async fn new(settings: AppSettings) -> Result<Self, Box<dyn StdError>> {
         tracing::info!("Initializing KTW scraper");
-        let client = Client::builder().cookie_store(true).build()?;
+        // Add timeout to client
+        let client = Client::builder()
+            .cookie_store(true)
+            .timeout(Duration::from_secs(30)) // Add a 30-second timeout
+            .build()?;
         Ok(Self { client, settings })
+    }
+
+    // Add this new method for retrying stock checks
+    async fn check_stock_with_retry(
+        &self,
+        sku: &str,
+        max_retries: u32,
+    ) -> Result<i32, Box<dyn StdError>> {
+        let mut retries = 0;
+        let mut delay = 1000; // Start with 1 second delay
+
+        loop {
+            match self.check_stock(sku).await {
+                Ok(stock) => return Ok(stock),
+                Err(e) => {
+                    if retries >= max_retries {
+                        return Err(e);
+                    }
+
+                    retries += 1;
+                    tracing::warn!("Retry {}/{} for SKU {}: {}", retries, max_retries, sku, e);
+
+                    // Exponential backoff
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    delay *= 2; // Double the delay for next retry
+                }
+            }
+        }
     }
 
     async fn get_csrf_token(&self) -> Result<String, Box<dyn StdError>> {
@@ -358,6 +392,22 @@ impl KTWScraper {
         Ok(())
     }
 
+    // Add this new method to check if website is blocking us
+    async fn check_if_blocked(&self) -> bool {
+        let response = self.client.get(&self.settings.shop_url).send().await;
+
+        match response {
+            Ok(res) => {
+                if res.status().is_client_error() {
+                    tracing::error!("Possible blocking detected: {}", res.status());
+                    return true;
+                }
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
     // Modified version of update_product_stocks method
     #[instrument(skip(self))]
     async fn update_product_stocks(
@@ -367,6 +417,8 @@ impl KTWScraper {
     ) -> Result<(), Box<dyn StdError>> {
         // Login first
         self.login().await?;
+        let mut last_login_time = Instant::now();
+        let login_refresh_interval = Duration::from_secs(3600); // 1 hour
 
         // Load existing products
         let mut products = self.load_csv_products()?;
@@ -389,11 +441,33 @@ impl KTWScraper {
         tracing::info!("Created temporary directory for chunk files: {}", temp_dir);
 
         // Process in chunks
-        let concurrent_requests = 30;
+        let concurrent_requests = 10; // Reduced from 30 to avoid triggering anti-bot measures
         let mut processed_count = 0;
         let mut changes_count = 0;
+        let mut consecutive_failures = 0;
+        const MAX_CONSECUTIVE_FAILURES: usize = 5;
 
         for (chunk_index, keys_chunk) in product_keys.chunks(chunk_size).enumerate() {
+            // Check if we need to refresh login
+            if last_login_time.elapsed() > login_refresh_interval {
+                tracing::info!("Refreshing login session");
+                self.login().await?;
+                last_login_time = Instant::now();
+            }
+
+            // Check if we're being blocked
+            if self.check_if_blocked().await {
+                tracing::error!("Detected possible blocking, pausing for 15 minutes");
+                bot.send_message(
+                    self.settings.chat_id.clone(),
+                    "Detected possible blocking from server. Pausing for 15 minutes to recover.",
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_secs(900)).await; // 15 minute pause
+                self.login().await?; // Try logging in again
+                last_login_time = Instant::now();
+            }
+
             let chunk_start = Instant::now();
             tracing::info!(
                 "Processing chunk {}/{} ({} products)",
@@ -403,7 +477,7 @@ impl KTWScraper {
             );
 
             // Send notification for chunk start
-            if (chunk_index + 1) % 5 == 0 {
+            if (chunk_index + 1) % 100 == 0 {
                 bot.send_message(
                     self.settings.chat_id.clone(),
                     format!(
@@ -441,7 +515,13 @@ impl KTWScraper {
                 .map(|(sku, current_stock)| {
                     let scraper = self;
                     async move {
-                        let stock_result = scraper.check_stock(&sku).await;
+                        // Use the updated API for rand
+                        let mut rng = rand::thread_rng();
+                        let delay = rng.gen_range(500..2000);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                        // Use retry logic
+                        let stock_result = scraper.check_stock_with_retry(&sku, 3).await;
                         (sku, current_stock, stock_result)
                     }
                 })
@@ -453,20 +533,49 @@ impl KTWScraper {
             let mut chunk_changes = 0;
             for (sku, current_stock, stock_result) in results {
                 if let Some(product) = chunk_products.get_mut(&sku) {
-                    if let Ok(new_stock) = stock_result {
-                        // Only mark as "pending" if the stock actually changed
-                        if current_stock != new_stock {
-                            product.stock_quantity = new_stock;
-                            product.stock_status = if new_stock > 0 { 1 } else { 0 };
-                            product.result = "pending".to_string();
-                            chunk_changes += 1;
+                    match stock_result {
+                        Ok(new_stock) => {
+                            // Only mark as "pending" if the stock actually changed
+                            if current_stock != new_stock {
+                                product.stock_quantity = new_stock;
+                                product.stock_status = if new_stock > 0 { 1 } else { 0 };
+                                product.result = "pending".to_string();
+                                chunk_changes += 1;
 
-                            tracing::info!(
+                                tracing::info!(
+                                    sku = %sku,
+                                    old_stock = current_stock,
+                                    new_stock = new_stock,
+                                    "Stock changed - marked as pending"
+                                );
+                            }
+                            consecutive_failures = 0; // Reset failure count on success
+                        }
+                        Err(e) => {
+                            tracing::error!(
                                 sku = %sku,
-                                old_stock = current_stock,
-                                new_stock = new_stock,
-                                "Stock changed - marked as pending"
+                                error = %e,
+                                "Failed to check stock"
                             );
+                            consecutive_failures += 1;
+
+                            // Implement circuit breaker
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                tracing::error!(
+                                    "Too many consecutive failures, pausing for recovery"
+                                );
+                                bot.send_message(
+                                    self.settings.chat_id.clone(),
+                                    format!("Warning: Too many failures detected. Pausing for 5 minutes to recover."),
+                                ).await?;
+
+                                tokio::time::sleep(Duration::from_secs(300)).await; // 5 minute pause
+                                consecutive_failures = 0;
+
+                                // Refresh login
+                                self.login().await?;
+                                last_login_time = Instant::now();
+                            }
                         }
                     }
                 }
@@ -511,14 +620,14 @@ impl KTWScraper {
                 self.save_csv_products(&products)?;
 
                 bot.send_message(
-					self.settings.chat_id.clone(),
-					format!("Progress update: Processed {}/{} products ({}%). {} changes detected. Saved intermediate results.", 
-						processed_count,
-						total_products,
-						(processed_count as f64 / total_products as f64 * 100.0) as u32,
-						changes_count
-					)
-				).await?;
+                    self.settings.chat_id.clone(),
+                    format!("Progress update: Processed {}/{} products ({}%). {} changes detected. Saved intermediate results.", 
+                        processed_count,
+                        total_products,
+                        (processed_count as f64 / total_products as f64 * 100.0) as u32,
+                        changes_count
+                    )
+                ).await?;
             }
 
             tracing::info!(
@@ -1043,7 +1152,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // Configure chunking parameters
     let chunk_size = settings.chunk_size; // Process 100 products at a time
-    let save_interval = 1; // Save after each chunk
+    let save_interval = 100; // Save after each chunk
 
     // Start scraping
     let start = Instant::now();
